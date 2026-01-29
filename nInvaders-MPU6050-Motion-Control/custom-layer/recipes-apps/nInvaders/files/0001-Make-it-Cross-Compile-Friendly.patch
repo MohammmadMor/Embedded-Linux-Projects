@@ -1,0 +1,21 @@
+From 32df416463739b00e0055896edcedc92838c9822 Mon Sep 17 00:00:00 2001
+From: MohammmadMor <mmreticent@gmail.com>
+Date: Tue, 30 Dec 2025 00:25:51 +0330
+Subject: [PATCH] Make it Cross-Compile Freindly
+
+---
+ Makefile | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/Makefile b/Makefile
+index d815e2f..2a4207b 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,5 +1,5 @@
+-CC=gcc
+-CFLAGS=-O3 -Wall
++CC?=gcc
++CFLAGS=-O3 -Wall -fcommon
+ LIBS=-lncurses
+ 
+ CFILES=globals.c view.c aliens.c ufo.c player.c nInvaders.c

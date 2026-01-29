@@ -1,0 +1,259 @@
+diff --git a/nInvader.c b/nInvader.c
+index 793139c..8f04397 100644
+--- a/nInvaders.c
++++ b/nInvaders.c
+@@ -1,29 +1,10 @@
+-/**
+- * nInvaders - a space invaders clone for ncurses
+- * Copyright (C) 2002-2003 Dettus
+- *
+- * This program is free software; you can redistribute it and/or modify
+- * it under the terms of the GNU General Public License as published by
+- * the Free Software Foundation; either version 2 of the License, or
+- * (at your option) any later version.
+- *
+- * This program is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+- * GNU General Public License for more details.
+- *
+- * You should have received a copy of the GNU General Public License
+- * along with this program; if not, write to the Free Software
+- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
+- *
+- * homepage: http://ninvaders.sourceforge.net
+- * mailto: ninvaders-devel@lists.sourceforge.net
+- *
+- */
+-
+-
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <dirent.h>
++#include <errno.h>
+ #include <sys/time.h>
+ #include "nInvaders.h"
+ #include "player.h"
+@@ -36,6 +17,33 @@ int lives;
+ long score;
+ int status; // status handled in timer
+ 
++// MPU6050 configuration
++#define MPU_Y_THRESHOLD_MOVEMENT 300    // Threshold for 5cm movement
++#define MPU_Z_THRESHOLD_SHOOT 120       // Threshold for 2cm lift
++#define MPU_SHOOT_COOLDOWN 20           // Delay between shots
++#define CALIBRATION_SAMPLES 50          // Number of calibration samples
++
++// Possible MPU6050 paths
++static const char* mpu_y_paths[] = {
++    "/sys/bus/iio/devices/iio:device0/in_accel_y_raw",
++    "/sys/bus/iio/devices/iio:device1/in_accel_y_raw",
++    "/sys/bus/iio/devices/iio:device2/in_accel_y_raw",
++    "/sys/bus/iio/devices/iio:device3/in_accel_y_raw",
++    NULL
++};
++
++static const char* mpu_z_paths[] = {
++    "/sys/bus/iio/devices/iio:device0/in_accel_z_raw",
++    "/sys/bus/iio/devices/iio:device1/in_accel_z_raw",
++    "/sys/bus/iio/devices/iio:device2/in_accel_z_raw",
++    "/sys/bus/iio/devices/iio:device3/in_accel_z_raw",
++    NULL
++};
++
++static char mpu_y_path[256] = "";
++static char mpu_z_path[256] = "";
++static int mpu_available = 0;
++
+ #define GAME_LOOP 1
+ #define GAME_NEXTLEVEL 2
+ #define GAME_PAUSED 3
+@@ -128,15 +136,169 @@ void drawscore()
+ }
+ 
+ 
++/**
++ * Find MPU6050 device
++ */
++static void find_mpu_device(void)
++{
++    printf("Searching for MPU6050 device...\n");
++    
++    // Try predefined paths
++    for (int i = 0; mpu_y_paths[i] != NULL; i++) {
++        int fd = open(mpu_y_paths[i], O_RDONLY);
++        if (fd >= 0) {
++            char buf[32];
++            ssize_t n = read(fd, buf, sizeof(buf) - 1);
++            close(fd);
++            
++            if (n > 0) {
++                strcpy(mpu_y_path, mpu_y_paths[i]);
++                strcpy(mpu_z_path, mpu_z_paths[i]);
++                mpu_available = 1;
++                printf("MPU6050 device found: %s\n", mpu_y_path);
++                return;
++            }
++        }
++    }
++    
++    // Dynamic search in sysfs
++    DIR *dir = opendir("/sys/bus/iio/devices/");
++    if (dir) {
++        struct dirent *entry;
++        while ((entry = readdir(dir)) != NULL) {
++            if (strstr(entry->d_name, "iio:device")) {
++                char test_path[256];
++                snprintf(test_path, sizeof(test_path),
++                        "/sys/bus/iio/devices/%s/in_accel_y_raw", entry->d_name);
++                
++                int fd = open(test_path, O_RDONLY);
++                if (fd >= 0) {
++                    char buf[32];
++                    ssize_t n = read(fd, buf, sizeof(buf) - 1);
++                    close(fd);
++                    
++                    if (n > 0) {
++                        snprintf(mpu_y_path, sizeof(mpu_y_path),
++                                "/sys/bus/iio/devices/%s/in_accel_y_raw", entry->d_name);
++                        snprintf(mpu_z_path, sizeof(mpu_z_path),
++                                "/sys/bus/iio/devices/%s/in_accel_z_raw", entry->d_name);
++                        mpu_available = 1;
++                        printf("MPU6050 device found: %s\n", mpu_y_path);
++                        closedir(dir);
++                        return;
++                    }
++                }
++            }
++        }
++        closedir(dir);
++    }
++    
++    if (!mpu_available) {
++        printf("MPU6050 device not found. Using keyboard only.\n");
++    }
++}
++
++/**
++ * Read value from MPU6050
++ */
++static int read_mpu_value(const char *path)
++{
++    if (!mpu_available || strlen(path) == 0) return 0;
++    
++    int fd = open(path, O_RDONLY);
++    if (fd < 0) {
++        mpu_available = 0;
++        return 0;
++    }
++    
++    char buf[32];
++    ssize_t n = read(fd, buf, sizeof(buf) - 1);
++    close(fd);
++    
++    if (n > 0) {
++        buf[n] = '\0';
++        return atoi(buf);
++    }
++    return 0;
++}
++
++
+ /**
+  * reads input from keyboard and do action
+  */
+ void readInput()
+ {
++    static int shoot_cooldown = 0;
++    static int y_baseline = 0;
++    static int z_baseline = 0;
++    static int baseline_set = 0;
++    static int calibration_counter = 0;
++    static int mpu_initialized = 0;
++    static int move_counter = 0;
++    
+ 	int ch;
+ 	static int lastmove;
++    
++    // Initialize MPU6050
++    if (!mpu_initialized) {
++        find_mpu_device();
++        mpu_initialized = 1;
++    }
++    
++    // Calibration if MPU6050 is available
++    if (mpu_available && calibration_counter < CALIBRATION_SAMPLES) {
++        y_baseline += read_mpu_value(mpu_y_path);
++        z_baseline += read_mpu_value(mpu_z_path);
++        calibration_counter++;
++        
++        if (calibration_counter == CALIBRATION_SAMPLES) {
++            y_baseline /= CALIBRATION_SAMPLES;
++            z_baseline /= CALIBRATION_SAMPLES;
++            baseline_set = 1;
++            printf("Calibration complete: Y=%d, Z=%d\n", y_baseline, z_baseline);
++        }
++        return; // Skip game input during calibration
++    }
++    
++    // Decrease shoot cooldown
++    if (shoot_cooldown > 0) {
++        shoot_cooldown--;
++    }
+ 
+ 	ch = getch();		// get key pressed
++    
++    // Read MPU6050 if no keyboard input and device is calibrated
++    if (ch == ERR && baseline_set && mpu_available) {
++        int y_val = read_mpu_value(mpu_y_path);
++        int z_val = read_mpu_value(mpu_z_path);
++        int y_diff = y_val - y_baseline;
++        int z_diff = z_val - z_baseline;
++        
++        // Movement control - for 5cm movement
++        if (y_diff > MPU_Y_THRESHOLD_MOVEMENT) {
++            // Move right - speed control
++            if (move_counter % 2 == 0) {
++                ch = KEY_RIGHT;
++            }
++            move_counter++;
++        } else if (y_diff < -MPU_Y_THRESHOLD_MOVEMENT) {
++            // Move left - speed control
++            if (move_counter % 2 == 0) {
++                ch = KEY_LEFT;
++            }
++            move_counter++;
++        } else {
++            move_counter = 0;
++        }
++        
++        // Shoot with 2cm lift
++        if (shoot_cooldown == 0 && z_diff > MPU_Z_THRESHOLD_SHOOT) {
++            playerLaunchMissile();
++            shoot_cooldown = MPU_SHOOT_COOLDOWN;
++        }
++    } else {
++        move_counter = 0;
++    }
+ 
+ 	switch (status) {
+ 
+@@ -337,6 +499,10 @@ int main(int argc, char **argv)
+ 	evaluateCommandLine(argc, argv);	// evaluate command line parameters
+ 	graphicEngineInit();			// initialize graphic engine
+ 	
++	// Enable non-blocking input for smooth control
++	nodelay(stdscr, TRUE);
++	keypad(stdscr, TRUE);
++	
+ 	// set up timer/ game handling
+ 	setUpTimer();		
+ 	status = GAME_HIGHSCORE;
+@@ -364,4 +530,3 @@ void doScoring(int alienType)
+ 	
+ 	drawscore();	// display score
+ }
+-

@@ -1,0 +1,12 @@
+[Unit]
+Description=Initialize MPU6050 device
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/mpu6050-init
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+
